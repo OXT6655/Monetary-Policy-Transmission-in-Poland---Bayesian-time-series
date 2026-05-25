@@ -21,7 +21,7 @@ Model    :  Y = X B + E,    E ~ MN(0, I_T, Sigma)
 Prior    :  B|Sigma ~ MN(B0, Omega0, Sigma),   Sigma ~ IW(S0, nu0)   [Minnesota / NIW]
 Posterior:  Gibbs sampler
             • B   | Sigma, Y ~ MN(Bn, Omegan, Sigma)
-            • Sigma | B, Y ~ IW(S0 + E'E + (B-B0)'Omega0^-1(B-B0), nu0+T)
+            • Sigma | B, Y ~ IW(S0 + E'E + (B-B0)'Omega0^-1(B-B0), nu0+T+k)
 Ident.   :  Cholesky structural identification (baseline: CPI, Rate, PLN/EUR)
             + sensitivity to alternative orderings
 Diagnost.:  ESS (Geyer IMS), Geweke Z, trace / ACF / burn-in / posterior plots
@@ -246,7 +246,10 @@ def run_gibbs(Y_dep, X, B0, Omega0_inv, S0, nu0,
     """
     Full conditional Sigma | B, Y:
       Sn = S0 + E'E + (B-B0)'Omega0^-1(B-B0)
-      nu_n = nu0 + T
+      nu_n = nu0 + T + k
+    The +k term comes from the conditional prior B|Sigma ~ MN(B0, Omega0, Sigma),
+    whose density contributes |Sigma|^(-k/2) to p(Sigma|B,Y) under the joint NIW
+    prior.
     """
     T, n   = Y_dep.shape
     k      = X.shape[1]
@@ -256,7 +259,7 @@ def run_gibbs(Y_dep, X, B0, Omega0_inv, S0, nu0,
     Omega_n     = np.linalg.inv(Omega_n_inv)
     Omega_n     = (Omega_n + Omega_n.T) / 2
     B_n         = Omega_n @ (Omega0_inv @ B0 + X.T @ Y_dep)
-    nu_post     = nu0 + T
+    nu_post     = nu0 + T + k
 
     B_store     = np.zeros((n_keep, k, n))
     Sigma_store = np.zeros((n_keep, n, n))
