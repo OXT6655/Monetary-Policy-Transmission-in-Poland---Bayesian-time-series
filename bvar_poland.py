@@ -11,7 +11,7 @@ DATA SOURCES (real, official)
   CPI YoY    : OECD / FRED series POLCPIALLMINMEI (CPI index 2015=100, monthly)
                YoY computed as (CPI_t / CPI_{t-12} - 1)*100
   Policy Rate: OECD / FRED series IRSTCI01PLM156N (short-term interest rate, %)
-  PLN/EUR    : ECB reference exchange rate, monthly average
+  PLN/EUR    : ECB reference exchange rate, monthly average (log level in the VAR)
 
 SAMPLE: January 2010 – March 2025
 
@@ -21,11 +21,12 @@ Model    :  Y = X B + E,    E ~ MN(0, I_T, Sigma)
 Prior    :  B|Sigma ~ MN(B0, Omega0, Sigma),   Sigma ~ IW(S0, nu0)   [Minnesota / NIW]
 Posterior:  Gibbs sampler
             • B   | Sigma, Y ~ MN(Bn, Omegan, Sigma)
-            • Sigma | B, Y ~ IW(S0 + E'E + (B-B0)'Omega0^-1(B-B0), nu0+T+k)
-Ident.   :  Cholesky structural identification (baseline: CPI, Rate, PLN/EUR)
+            • Sigma | B, Y ~ IW(Sn, nu0 + T)  with Sn = S0 + E'E + (B-B0)'Omega0^-1(B-B0)
+Ident.   :  Cholesky (baseline: Policy rate, CPI, ln PLN/EUR — policy exogenous within month)
             + sensitivity to alternative orderings
+Station. :  ADF + KPSS; Johansen cointegration; companion-matrix stability
 Diagnost.:  ESS (Geyer IMS), Geweke Z, trace / ACF / burn-in / posterior plots
-Forecast :  12-month posterior predictive
+Forecast :  12-month posterior predictive (reduced-form innovations)
 Benchmark:  Classical OLS VAR via statsmodels
 """
 
@@ -40,7 +41,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from statsmodels.tsa.vector_ar.var_model import VAR
-from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.vector_ar.vecm import coint_johansen
+from statsmodels.tsa.stattools import adfuller, kpss
 
 warnings.filterwarnings('ignore', category=FutureWarning)
 warnings.filterwarnings('ignore', message='.*unsupported index.*')
@@ -51,16 +53,17 @@ plt.rcParams.update({'figure.dpi': 120, 'font.size': 9,
                      'legend.fontsize': 7})
 
 COLORS  = ['#A23B72', '#2E86AB', '#F18F01']
-VARLAB  = ['CPI YoY (%)', 'Policy Rate (%)', 'PLN/EUR']
-VARNAME = ['cpi_yoy', 'policy_rate', 'plneur']
+VARLAB  = ['CPI YoY (%)', 'Policy Rate (%)', 'ln(PLN/EUR)']
+VARNAME = ['cpi_yoy', 'policy_rate', 'ln_plneur']
 OUT     = 'output_bvar'
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Cholesky orderings for identification sensitivity (indices into [CPI, Rate, FX])
-BASE_ORDER = [0, 1, 2]
+# Variable order in data columns: [cpi_yoy, policy_rate, ln_plneur]
+# Baseline Cholesky: policy rate first (exogenous within month), then CPI, then FX.
+BASE_ORDER = [1, 0, 2]
 ID_ORDERS = {
-    'cpi_rate_fx': [0, 1, 2],
     'rate_cpi_fx': [1, 0, 2],
+    'cpi_rate_fx': [0, 1, 2],
     'rate_fx_cpi': [1, 2, 0],
 }
 PRIOR_LAMBDAS = [0.10, 0.20, 0.50]
@@ -106,10 +109,11 @@ def build_data() -> pd.DataFrame:
     ir.name = 'policy_rate'
 
     dates = pd.date_range('2010-01-01', '2025-03-01', freq='MS')
+    pln_eur = fx['plneur'].reindex(dates)
     df = pd.DataFrame({
         'cpi_yoy'    : cpi_yoy.reindex(dates),
         'policy_rate': ir.reindex(dates),
-        'plneur'     : fx['plneur'].reindex(dates),
+        'ln_plneur'  : np.log(pln_eur),
     }).dropna()
     return df
 
@@ -119,6 +123,17 @@ def make_differenced(df: pd.DataFrame) -> pd.DataFrame:
     d = df.diff().dropna()
     d.columns = [f'd_{c}' for c in df.columns]
     return d
+
+
+def make_mixed_stationary(df: pd.DataFrame) -> pd.DataFrame:
+    """CPI YoY and policy rate in levels; monthly log change of the exchange rate."""
+    dln_fx = df['ln_plneur'].diff()
+    out = pd.DataFrame({
+        'cpi_yoy': df['cpi_yoy'],
+        'policy_rate': df['policy_rate'],
+        'dln_plneur': dln_fx,
+    }, index=df.index).dropna()
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -135,14 +150,45 @@ def adf_test(series, regression='ct'):
     }
 
 
+def kpss_test(series, regression='ct'):
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        stat, pval, _, crit = kpss(series.dropna(), regression=regression, nlags='auto')
+    return {
+        'KPSS stat': round(stat, 3),
+        'p-value': round(pval, 3),
+        '10% CV': round(crit['10%'], 3),
+        'Stationary (10%)': 'YES' if pval > 0.10 else 'NO',
+    }
+
+
 def stationarity_report(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for col in df.columns:
-        lvl = adf_test(df[col], regression='ct')
-        rows.append({'Variable': col, 'Spec': 'Levels (const+trend)', **lvl})
-        diff = adf_test(df[col].diff().dropna(), regression='c')
-        rows.append({'Variable': col, 'Spec': 'First difference (const)', **diff})
-    return pd.DataFrame(rows).set_index(['Variable', 'Spec'])
+        lvl_adf = adf_test(df[col], regression='ct')
+        rows.append({'Variable': col, 'Test': 'ADF', 'Spec': 'Levels (const+trend)', **lvl_adf})
+        diff_adf = adf_test(df[col].diff().dropna(), regression='c')
+        rows.append({'Variable': col, 'Test': 'ADF', 'Spec': 'First difference (const)', **diff_adf})
+        lvl_kpss = kpss_test(df[col], regression='ct')
+        rows.append({'Variable': col, 'Test': 'KPSS', 'Spec': 'Levels (const+trend)', **lvl_kpss})
+    return pd.DataFrame(rows).set_index(['Variable', 'Test', 'Spec'])
+
+
+def johansen_report(df: pd.DataFrame, p: int) -> pd.DataFrame:
+    """Johansen trace test (constant in cointegrating relations)."""
+    k_ar_diff = max(p - 1, 0)
+    res = coint_johansen(df.values, det_order=0, k_ar_diff=k_ar_diff)
+    rows = []
+    for r in range(len(df.columns)):
+        rows.append({
+            'rank_r': r,
+            'trace_stat': round(res.lr1[r], 3),
+            'trace_95pct': round(res.cvt[r, 1], 3),
+            'reject_5pct': 'YES' if res.lr1[r] > res.cvt[r, 1] else 'NO',
+            'max_eig_stat': round(res.lr2[r], 3),
+            'max_eig_95pct': round(res.cvm[r, 1], 3),
+        })
+    return pd.DataFrame(rows).set_index('rank_r')
 
 
 def select_var_lag(df: pd.DataFrame, maxlags: int = 4) -> pd.DataFrame:
@@ -256,7 +302,7 @@ def run_gibbs(Y_dep, X, B0, Omega0_inv, S0, nu0,
     Omega_n     = np.linalg.inv(Omega_n_inv)
     Omega_n     = (Omega_n + Omega_n.T) / 2
     B_n         = Omega_n @ (Omega0_inv @ B0 + X.T @ Y_dep)
-    nu_post     = nu0 + T + k
+    nu_post     = nu0 + T
 
     B_store     = np.zeros((n_keep, k, n))
     Sigma_store = np.zeros((n_keep, n, n))
@@ -413,26 +459,68 @@ def print_diagnostics(B_store, Sigma_store, n, k):
     print()
 
 
-def export_posterior_tables(result, adf_df, lag_df, tag='baseline'):
+def companion_eigenvalues(B_mean, n, p):
+    A_comp = np.zeros((n * p, n * p))
+    for lag in range(p):
+        A_comp[:n, lag * n:(lag + 1) * n] = B_mean[1 + lag * n:1 + (lag + 1) * n, :].T
+    if p > 1:
+        A_comp[n:, :n * (p - 1)] = np.eye(n * (p - 1))
+    return np.linalg.eigvals(A_comp)
+
+
+def stability_report(B_mean, n, p) -> pd.DataFrame:
+    eig = companion_eigenvalues(B_mean, n, p)
+    mod = np.abs(eig)
+    return pd.DataFrame({
+        'eigenvalue_modulus': mod,
+        'stable': mod < 1.0,
+    })
+
+
+def export_posterior_tables(result, adf_df, lag_df, tag='baseline', johansen_df=None):
     B_store = result['B_store']
     p, n = result['p'], result['n']
+    eq_names = list(result['df'].columns)
     row_labels = ['const'] + [
-        f'{v}_l{l}' for l in range(1, p + 1) for v in ['cpi', 'rate', 'fx']]
+        f'{v}_l{l}' for l in range(1, p + 1) for v in ['cpi', 'rate', 'lnfx']]
 
     rows = []
     for j, rl in enumerate(row_labels):
         for i in range(n):
             ch = B_store[:, j, i]
             rows.append({
-                'model': tag, 'row': rl, 'equation': VARNAME[i],
+                'model': tag, 'row': rl, 'equation': eq_names[i],
                 'mean': ch.mean(), 'std': ch.std(),
                 'p05': np.percentile(ch, 5), 'p95': np.percentile(ch, 95),
                 'ess': ess(ch), 'geweke_z': geweke(ch),
             })
     pd.DataFrame(rows).to_csv(f'{OUT}/posterior_{tag}.csv', index=False)
-    adf_df.to_csv(f'{OUT}/stationarity_adf.csv')
+    adf_df.to_csv(f'{OUT}/stationarity_tests.csv')
     lag_df.to_csv(f'{OUT}/lag_selection.csv')
-    print(f"  [saved] stationarity_adf.csv, lag_selection.csv, posterior_{tag}.csv")
+    stab = stability_report(result['B_mean'], n, p)
+    stab.to_csv(f'{OUT}/stability_{tag}.csv', index=True)
+    if johansen_df is not None and tag == 'baseline':
+        johansen_df.to_csv(f'{OUT}/cointegration_johansen.csv')
+    print(f"  [saved] stationarity_tests.csv, lag_selection.csv, "
+          f"posterior_{tag}.csv, stability_{tag}.csv")
+
+
+def export_policy_irf_summary(irf_all, shock_idx=1, h_max=24):
+    """Peak CPI and FX responses to a policy-rate shock (median IRF)."""
+    q50 = np.median(irf_all[:, :, shock_idx, :h_max + 1], axis=0)
+    rows = []
+    for resp_idx, name in enumerate(VARNAME):
+        path = q50[resp_idx, :h_max + 1]
+        peak_h = int(np.argmax(np.abs(path)))
+        rows.append({
+            'response': name,
+            'peak_month': peak_h,
+            'peak_value': round(path[peak_h], 5),
+            'impact_0': round(path[0], 5),
+            'horizon_12': round(path[min(12, h_max)], 5),
+        })
+    pd.DataFrame(rows).to_csv(f'{OUT}/irf_policy_shock_summary.csv', index=False)
+    print("  [saved] irf_policy_shock_summary.csv")
 
 
 # ---------------------------------------------------------------------------
@@ -477,7 +565,7 @@ def plot_raw_data(df):
         _shade(ax)
     axes[0].set_title(
         'Polish Macro Data 2010-2025  [OECD/FRED & ECB]\n'
-        'CPI YoY  |  Short-term Interest Rate  |  PLN/EUR',
+        'CPI YoY  |  Short-term Interest Rate  |  ln(PLN/EUR)',
         fontweight='bold')
     fig.tight_layout()
     fig.savefig(f'{OUT}/01_data.png', bbox_inches='tight')
@@ -485,7 +573,7 @@ def plot_raw_data(df):
     print("  [saved] 01_data.png")
 
 
-def plot_irfs(irf_all, shock_idx, fname, order_label='Cholesky [CPI, Rate, FX]'):
+def plot_irfs(irf_all, shock_idx, fname, order_label='Cholesky [Rate, CPI, ln FX]'):
     n, h_max = irf_all.shape[1], irf_all.shape[3] - 1
     hz   = np.arange(h_max + 1)
     q05  = np.quantile(irf_all[:, :, shock_idx, :], 0.05, axis=0)
@@ -600,7 +688,7 @@ def plot_robustness_comparison(irf_levels, irf_diff, shock_idx=1, h_max=24):
         ax.plot(hz, q50, color=c, lw=2.2, label=lbl)
     ax.axhline(0, color='k', lw=0.8, ls='--')
     ax.set_xlabel('Months')
-    ax.set_ylabel(f'Response of inflation / d(CPI YoY)')
+    ax.set_ylabel('CPI response (levels vs first-diff spec)')
     ax.set_title(
         f'Stationarity Robustness — CPI Response to {VARLAB[shock_idx]} Shock',
         fontweight='bold')
@@ -761,13 +849,19 @@ def main():
     plot_raw_data(df)
 
     # 2. Stationarity
-    print("\n[2] Stationarity (ADF: levels + first differences)")
-    adf_df = stationarity_report(df)
+    print("\n[2] Stationarity tests")
+    stat_df = stationarity_report(df)
+    adf_df = stat_df.xs('ADF', level='Test')
+    kpss_df = stat_df.xs('KPSS', level='Test')
+    print("    ADF:")
     print(adf_df.to_string())
-    n_nonstat_levels = (adf_df.xs('Levels (const+trend)', level='Spec')['H0 rejected (5%)'] == 'NO').sum()
+    print("\n    KPSS (H0: stationary):")
+    print(kpss_df[['KPSS stat', 'p-value', '10% CV', 'Stationary (10%)']].to_string())
+    adf_levels = adf_df.xs('Levels (const+trend)', level='Spec')
+    n_nonstat_levels = (adf_levels['H0 rejected (5%)'] == 'NO').sum()
     if n_nonstat_levels == len(df.columns):
-        print("    NOTE: All series fail to reject unit root in levels.")
-        print("          First-difference specs and robustness check follow below.")
+        print("    NOTE: ADF does not reject unit roots in levels for all variables.")
+        print("          Minnesota shrinkage + Johansen / robustness checks follow.")
 
     # 3. Lag selection
     print("\n[3] Lag order selection (AIC / BIC / HQIC)")
@@ -776,19 +870,31 @@ def main():
     p = int(lag_df.index[lag_df['BIC pick'] == '*'][0])
     print(f"    Selected lag order: p = {p} (min BIC)")
 
+    print("\n[3b] Johansen cointegration (trace test, det_order=0)")
+    johansen_df = johansen_report(df, p)
+    print(johansen_df.to_string())
+    n_coint = int((johansen_df['reject_5pct'] == 'YES').sum())
+    print(f"    Trace tests reject rank <= r for r = 0,...,{n_coint - 1}; "
+          f"reported rank >= {n_coint} (compare with ADF/KPSS and robustness VARs).")
+
     # 4. Baseline BVAR
     print(f"\n[4] Baseline BVAR({p}) — Minnesota prior (lambda1=0.20)")
     result = fit_bvar(df, p, lam1=0.20, n_draw=12000, n_burn=4000)
     B_store, Sig_store = result['B_store'], result['Sig_store']
     B_mean, Sigma_mean = result['B_mean'], result['Sigma_mean']
     n, k = result['n'], result['k']
-    export_posterior_tables(result, adf_df, lag_df, tag='baseline')
+    export_posterior_tables(result, stat_df, lag_df, tag='baseline', johansen_df=johansen_df)
+
+    eig = companion_eigenvalues(B_mean, n, p)
+    max_mod = np.abs(eig).max()
+    print(f"    Companion matrix: max |eigenvalue| = {max_mod:.4f}  "
+          f"({'stable' if max_mod < 1 else 'UNSTABLE — check specification'})")
 
     print(f"    sigma_ar: {dict(zip(VARLAB, result['sigma_ar'].round(4)))}")
     print(f"    Prior: nu0={result['nu0']}, diag(S0)={np.diag(build_minnesota_prior(n, p, k, result['sigma_ar'])[3]).round(5)}")
 
     row_labels = ['const'] + [
-        f'{v}_l{l}' for l in range(1, p + 1) for v in ['cpi', 'rate', 'fx']]
+        f'{v}_l{l}' for l in range(1, p + 1) for v in ['cpi', 'rate', 'lnfx']]
     print("\n    Posterior B — mean [std] (5%,95%)")
     header = f"  {'':15}" + "".join(f"  {lb:>24}" for lb in VARLAB)
     print(header)
@@ -813,6 +919,7 @@ def main():
     irf_all = posterior_irfs(B_store, Sig_store, n, p, h_max=36, order=BASE_ORDER)
     for shock in range(n):
         plot_irfs(irf_all, shock, f'02_irf_shock{shock}_{VARNAME[shock]}')
+    export_policy_irf_summary(irf_all, shock_idx=1, h_max=36)
 
     # 7. Identification sensitivity
     print("\n[7] Identification sensitivity (alternative Cholesky orderings)")
@@ -832,14 +939,25 @@ def main():
             sens['B_store'], sens['Sig_store'], n, p, h_max=24, order=BASE_ORDER))
     plot_prior_sensitivity(irf_by_lambda, shock_idx=1, h_max=24)
 
-    # 9. Stationarity robustness (first differences)
-    print("\n[9] Stationarity robustness — BVAR on first differences")
+    # 9. Stationarity robustness
+    print("\n[9a] Robustness — first differences of all variables")
     df_diff = make_differenced(df)
     diff_result = fit_bvar(df_diff, p, lam1=0.20, n_draw=6000, n_burn=2000, verbose=False)
     irf_diff = posterior_irfs(
         diff_result['B_store'], diff_result['Sig_store'], n, p, h_max=24, order=BASE_ORDER)
     plot_robustness_comparison(irf_all, irf_diff, shock_idx=1, h_max=24)
-    export_posterior_tables(diff_result, adf_df, lag_df, tag='first_diff')
+    export_posterior_tables(diff_result, stat_df, lag_df, tag='first_diff')
+
+    print("\n[9b] Robustness — CPI & rate in levels, monthly d ln(FX)")
+    df_mix = make_mixed_stationary(df)
+    mix_result = fit_bvar(df_mix, p, lam1=0.20, n_draw=6000, n_burn=2000, verbose=False)
+    irf_mix = posterior_irfs(
+        mix_result['B_store'], mix_result['Sig_store'], n, p, h_max=24, order=BASE_ORDER)
+    export_posterior_tables(mix_result, stat_df, lag_df, tag='mixed_stationary')
+    q50_mix = np.median(irf_mix[:, 0, 1, :25], axis=0)
+    q50_lvl = np.median(irf_all[:, 0, 1, :25], axis=0)
+    print(f"    CPI IRF to policy shock @12m: baseline={q50_lvl[12]:.4f}, "
+          f"mixed-spec={q50_mix[12]:.4f}")
 
     # 10. Classical VAR benchmark
     print(f"\n[10] Classical VAR({p}) benchmark")

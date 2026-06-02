@@ -1,0 +1,4 @@
+rank_r,trace_stat,trace_95pct,reject_5pct,max_eig_stat,max_eig_95pct
+0,37.186,29.796,YES,18.581,21.131
+1,18.606,15.494,YES,13.402,14.264
+2,5.204,3.842,YES,5.204,3.842

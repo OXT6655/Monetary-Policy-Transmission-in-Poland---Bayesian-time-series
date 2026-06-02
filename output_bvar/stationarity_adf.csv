@@ -1,7 +1,0 @@
-Variable,Spec,ADF stat,p-value,5% CV,H0 rejected (5%)
-cpi_yoy,Levels (const+trend),-2.047,0.576,-3.437,NO
-cpi_yoy,First difference (const),-5.594,0.0,-2.879,YES
-policy_rate,Levels (const+trend),-1.948,0.629,-3.435,NO
-policy_rate,First difference (const),-4.273,0.0,-2.878,YES
-plneur,Levels (const+trend),-1.873,0.668,-3.435,NO
-plneur,First difference (const),-10.057,0.0,-2.878,YES

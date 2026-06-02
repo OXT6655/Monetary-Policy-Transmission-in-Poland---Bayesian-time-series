@@ -1,0 +1,10 @@
+Variable,Test,Spec,ADF stat,p-value,5% CV,H0 rejected (5%),KPSS stat,10% CV,Stationary (10%)
+cpi_yoy,ADF,Levels (const+trend),-2.047,0.576,-3.437,NO,,,
+cpi_yoy,ADF,First difference (const),-5.594,0.0,-2.879,YES,,,
+cpi_yoy,KPSS,Levels (const+trend),,0.013,,,0.209,0.119,NO
+policy_rate,ADF,Levels (const+trend),-1.948,0.629,-3.435,NO,,,
+policy_rate,ADF,First difference (const),-4.273,0.0,-2.878,YES,,,
+policy_rate,KPSS,Levels (const+trend),,0.01,,,0.333,0.119,NO
+ln_plneur,ADF,Levels (const+trend),-2.504,0.326,-3.435,NO,,,
+ln_plneur,ADF,First difference (const),-10.055,0.0,-2.878,YES,,,
+ln_plneur,KPSS,Levels (const+trend),,0.1,,,0.103,0.119,NO
